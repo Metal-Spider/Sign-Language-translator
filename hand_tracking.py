@@ -28,29 +28,43 @@ def draw_fps(img, fps):
                 cv2.FONT_HERSHEY_PLAIN, 2, (0, 255, 0), 2)
 
 
-def draw_hand_info(img, hand, index):
+def draw_skeleton(img, lm_list):
+    """Draw landmark dots and finger-bone connections."""
+    # Finger connections: (start_idx, end_idx)
+    connections = [
+        (0,1),(1,2),(2,3),(3,4),          # thumb
+        (0,5),(5,6),(6,7),(7,8),           # index
+        (0,9),(9,10),(10,11),(11,12),      # middle
+        (0,13),(13,14),(14,15),(15,16),    # ring
+        (0,17),(17,18),(18,19),(19,20),    # pinky
+        (5,9),(9,13),(13,17),              # palm knuckles
+    ]
+    for a, b in connections:
+        cv2.line(img, tuple(lm_list[a][:2]), tuple(lm_list[b][:2]),
+                 (0, 200, 255), 2)
+    for lm in lm_list:
+        cv2.circle(img, (lm[0], lm[1]), 5, (255, 255, 255), cv2.FILLED)
+
+
+def draw_hand_info(img, hand, index, detector):
     """
-    Overlay hand metadata (type, finger count, landmark count)
-    next to the hand's bounding box.
+    Overlay hand metadata (type, finger count) next to the bounding box.
+    Uses detector.fingersUp() — the cvzone 2.0 API.
     """
-    bbox        = hand["bbox"]          # (x, y, w, h)
-    hand_type   = hand["type"]          # 'Left' or 'Right'
-    lm_list     = hand["lmList"]        # 21 landmarks [(x,y,z), ...]
-    fingers_up  = hand["fingersUp"]     # [thumb, index, middle, ring, pinky]
+    bbox        = hand["bbox"]                   # (x, y, w, h)
+    hand_type   = hand["type"]                   # 'Left' / 'Right' / 'Unknown'
+    lm_list     = hand["lmList"]                 # 21 landmarks [[x,y,z], ...]
+    fingers_up  = detector.fingersUp(hand)       # [thumb, index, middle, ring, pinky]
     finger_count = sum(fingers_up)
 
     x, y, w, h = bbox
 
-    # label above the bounding box
     label_color = (255, 165, 0) if hand_type == "Right" else (0, 165, 255)
     label = f"#{index + 1} {hand_type}  Fingers: {finger_count}"
     cv2.putText(img, label, (x, y - 15),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, label_color, 2)
 
-    # small dot + coords for each landmark
-    for lm in lm_list:
-        cx, cy = lm[0], lm[1]
-        cv2.circle(img, (cx, cy), 5, (255, 255, 255), cv2.FILLED)
+    draw_skeleton(img, lm_list)
 
 
 def main():
@@ -82,7 +96,7 @@ def main():
         # ── Per-hand overlay ─────────────────────────────────────────────────
         if hands:
             for i, hand in enumerate(hands):
-                draw_hand_info(img, hand, i)
+                draw_hand_info(img, hand, i, detector)
 
             # Distance between index fingertips when both hands are visible
             if len(hands) == 2:

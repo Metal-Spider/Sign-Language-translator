@@ -52,7 +52,7 @@ def main():
         total_fingers = 0
         if hands:
             for hand in hands:
-                total_fingers += sum(hand["fingersUp"])
+                total_fingers += sum(detector.fingersUp(hand))  # cvzone 2.0 API
 
         draw_count(img, total_fingers)
 
