@@ -281,8 +281,8 @@ def main():
                     avg = average_vectors(record_buffer)
                     gestures[recording_letter] = avg
                     save_gestures(GESTURES_FILE, gestures)
-                    set_status(f"✔ Saved  '{recording_letter}'", (80, 255, 120))
-                    print(f"✔ Saved gesture for '{recording_letter}'")
+                    set_status(f"[OK] Saved '{recording_letter}'", (80, 255, 120))
+                    print(f"[OK] Saved gesture for '{recording_letter}'")
                     recording_letter = None
                     record_buffer    = []
             else:
@@ -332,9 +332,9 @@ def main():
             record_buffer    = []
             detected_letter  = None
             set_status(f"Switched to {mode} mode")
-            print(f"→ {mode} mode")
+            print(f"-> {mode} mode")
 
-        elif chr(key).upper() in LETTERS if key < 128 else False:
+        elif (chr(key).upper() in LETTERS) if 0 <= key < 128 else False:
             letter = chr(key).upper()
 
             if delete_armed and (time.time() - delete_arm_time < 1.5):
@@ -343,28 +343,28 @@ def main():
                     del gestures[letter]
                     save_gestures(GESTURES_FILE, gestures)
                     set_status(f"Deleted '{letter}'", (60, 60, 255))
-                    print(f"✖ Deleted gesture for '{letter}'")
+                    print(f"[X] Deleted gesture for '{letter}'")
                 else:
                     set_status(f"'{letter}' not saved yet", (140, 140, 140))
                 delete_armed = False
 
             elif mode == "RECORD":
                 if normalized is None:
-                    set_status("No hand detected — show your hand first!", (60, 60, 255))
-                    print("⚠ No hand in frame.")
+                    set_status("No hand detected - show your hand first!", (60, 60, 255))
+                    print("[!] No hand in frame.")
                 else:
                     recording_letter = letter
                     record_buffer    = []
-                    set_status(f"Hold pose for  '{letter}'…", (255, 200, 60), 3.0)
-                    print(f"● Recording '{letter}' — hold pose steady…")
+                    set_status(f"Hold pose for '{letter}'...", (255, 200, 60), 3.0)
+                    print(f"[*] Recording '{letter}' - hold pose steady...")
             else:
                 set_status("Switch to REC mode (SPACE) to record")
 
         elif key in (ord('x'), ord('X')):
             delete_armed    = True
             delete_arm_time = time.time()
-            set_status("Delete armed — press A-E to delete that gesture", (255, 100, 100))
-            print("Delete armed — press a letter within 1.5 s")
+            set_status("Delete armed - press A-E to delete that gesture", (255, 100, 100))
+            print("Delete armed - press a letter within 1.5 s")
 
     cap.release()
     cv2.destroyAllWindows()
