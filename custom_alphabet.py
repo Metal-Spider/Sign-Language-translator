@@ -30,10 +30,10 @@ GESTURES_FILE   = "gestures.json"
 LETTERS         = list("ABCDE")
 
 # How many frames to average when recording (more = smoother, slower)
-RECORD_FRAMES   = 40
+RECORD_FRAMES   = 25
 
-# Max normalised distance to count as a match (lower = stricter)
-MATCH_THRESHOLD = 0.40
+# Max normalised distance to count as a match (higher = more lenient)
+MATCH_THRESHOLD = 1.40
 # ─────────────────────────────────────────────────────────────────────────────
 
 SKELETON_CONNECTIONS = [
@@ -85,8 +85,27 @@ def average_vectors(vecs):
 
 
 def vec_distance(a, b):
-    """Euclidean distance between two flat landmark vectors."""
-    return math.sqrt(sum((x - y) ** 2 for x, y in zip(a, b)))
+    """
+    Rotation-tolerant Euclidean distance between two 42-float landmark vectors.
+    Checks wrist tilt angles from -30 to +30 degrees so the user doesn't have
+    to hold their wrist at the exact same angle as when they recorded the sign.
+    """
+    best = float("inf")
+    pairs_a = [(a[i], a[i + 1]) for i in range(0, len(a), 2)]
+    pairs_b = [(b[i], b[i + 1]) for i in range(0, len(b), 2)]
+
+    for deg in (-30, -20, -10, -5, 0, 5, 10, 20, 30):
+        rad = math.radians(deg)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+        total = 0.0
+        for (ax, ay), (bx, by) in zip(pairs_a, pairs_b):
+            rx = ax * cos_a - ay * sin_a
+            ry = ax * sin_a + ay * cos_a
+            total += (rx - bx) ** 2 + (ry - by) ** 2
+        d = math.sqrt(total)
+        if d < best:
+            best = d
+    return best
 
 
 # ── Gesture persistence ───────────────────────────────────────────────────────
@@ -157,8 +176,12 @@ def draw_sidebar(img, gestures, mode):
         y += 28
 
     y += 12
+    cv2.putText(img, f"Leniency: {MATCH_THRESHOLD:.2f}", (12, y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 220, 180), 1)
+    y += 24
     for hint in ["SPACE  toggle mode",
                  "A-E    record pose",
+                 "+ / -  more/less lenient",
                  "X+ltr  delete pose",
                  "Q/ESC  quit"]:
         cv2.putText(img, hint, (12, y),
@@ -221,6 +244,7 @@ def draw_status(img, message, color=(255, 220, 60)):
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
+    global MATCH_THRESHOLD
     cap = cv2.VideoCapture(CAM_INDEX)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
@@ -365,6 +389,16 @@ def main():
             delete_arm_time = time.time()
             set_status("Delete armed - press A-E to delete that gesture", (255, 100, 100))
             print("Delete armed - press a letter within 1.5 s")
+
+        elif key in (ord('+'), ord('=')):
+            MATCH_THRESHOLD = min(3.50, round(MATCH_THRESHOLD + 0.15, 2))
+            set_status(f"More lenient (threshold: {MATCH_THRESHOLD:.2f})", (120, 255, 120))
+            print(f"[+] Leniency threshold increased to {MATCH_THRESHOLD:.2f}")
+
+        elif key in (ord('-'), ord('_')):
+            MATCH_THRESHOLD = max(0.30, round(MATCH_THRESHOLD - 0.15, 2))
+            set_status(f"Stricter (threshold: {MATCH_THRESHOLD:.2f})", (255, 180, 80))
+            print(f"[-] Leniency threshold decreased to {MATCH_THRESHOLD:.2f}")
 
     cap.release()
     cv2.destroyAllWindows()
