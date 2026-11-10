@@ -6,11 +6,11 @@ Real-time hand tracking + a custom accessible sign language alphabet, using **Op
 
 | File | Description |
 |------|-------------|
-| `custom_alphabet.py` | **Custom alphabet system** — record your own A-E poses, works with missing fingers |
+| `custom_alphabet.py` | **Custom sign system**: record your own one- or two-hand signs for any word. Works with missing fingers |
 | `hand_tracking.py` | Hand tracking demo — landmarks, bounding boxes, finger count, inter-hand distance |
 | `finger_counter.py` | Finger count overlay (0–10) |
 | `requirements.txt` | Python dependencies |
-| `gestures.json` | Auto-created when you save your first gesture |
+| `gestures.json` | Your saved signs (created automatically) |
 
 ## Setup
 
@@ -18,33 +18,42 @@ Real-time hand tracking + a custom accessible sign language alphabet, using **Op
 pip install -r requirements.txt
 ```
 
-## Custom Alphabet (main feature)
+## Custom Signs (main feature)
 
 Designed for users with **any hand shape**, including missing fingers.  
-Instead of detecting "which fingers are up", it records the full hand shape and matches against it — so any pose maps to any letter.
+Instead of detecting "which fingers are up", it records the full shape of your hand(s) and matches against it, so any pose can mean any word.
+
+Signs can use **one or two hands**. The number of hands is detected automatically while recording.
 
 ```bash
 python custom_alphabet.py
 ```
 
-### How to use
+### Controls
 
 | Key | Action |
 |-----|--------|
-| `SPACE` | Toggle between **RECORD** and **DETECT** mode |
-| `A` `B` `C` `D` `E` | (in RECORD mode) Hold pose → press letter to save it |
-| `X` then a letter | Delete that gesture (within 1.5 s) |
-| `Q` / `ESC` | Quit |
+| `N` | New sign: type a word, press `ENTER`, then hold the pose |
+| `X` | Delete a sign: type its word, press `ENTER` |
+| `+` / `-` | More / less lenient matching |
+| `ESC` | Cancel a recording (quits when idle) |
+| `Q` | Quit |
+
+While typing a word: `ENTER` confirms, `BACKSPACE` erases, `ESC` cancels.
 
 **Step-by-step:**
-1. Run the script — left sidebar shows which letters are saved
-2. Hold your hand in the pose you want for letter **A**
-3. Press **A** — a progress bar fills over 40 frames, then saves
-4. Repeat for B–E
-5. Press **SPACE** to switch to DETECT mode
-6. Hold any saved pose — the matching letter appears big on screen with a confidence bar
+1. Press **N** and type a word, e.g. `HELLO` (letters, numbers, spaces, `'` and `-`, up to 16 characters)
+2. Press **ENTER**. You get a 3-second countdown to move your hands into position
+3. Show **one hand** for a one-hand sign, or **both hands** for a two-hand sign, and hold it until the progress bar fills
+4. Hold any saved sign and the word appears on screen with a confidence bar
 
-Gestures are saved to `gestures.json` and reload automatically next run.
+Recording a word that already exists replaces it. Signs are saved to `gestures.json` and load automatically next time. Signs saved by the older A–E version are converted automatically.
+
+### How two-hand signs are matched
+- Hands are ordered left-to-right on screen, so it doesn't matter which hand the camera sees first
+- **Both** hands must match their recorded shape; one correct hand can't make up for a wrong one
+- The spacing between your hands counts too (adjust `REL_WEIGHT` in the config to change how much)
+- If a two-hand pose doesn't match any two-hand sign, each hand is checked against your one-hand signs, so a one-hand sign still works when your other hand is in view
 
 ---
 

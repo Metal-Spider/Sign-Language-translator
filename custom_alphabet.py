@@ -1,16 +1,22 @@
 """
-Custom Sign Language Alphabet
-==============================
-Designed for users with any hand shape — including missing fingers.
-Instead of detecting "fingers up", it records the full 3D hand shape
-and matches against it, so any pose can be assigned any letter.
+Custom Sign Language Translator
+===============================
+Designed for users with any hand shape - including missing fingers.
+Instead of detecting "fingers up", it records the full hand shape(s)
+and matches against them, so any pose can be assigned any word.
+
+Signs can use ONE or TWO hands. The number of hands is detected
+automatically while recording, so both kinds of sign coexist.
 
 CONTROLS
 --------
-  SPACE      Toggle between RECORD and DETECT mode
-  A/B/C/D/E  (in RECORD mode) Record current pose for that letter
-  X + letter Delete saved gesture for that letter  (within 1.5 s)
-  Q / ESC    Quit
+  N          New sign: type a word, press ENTER, then hold the pose
+  X          Delete a sign: type its word, press ENTER
+  + / -      More / less lenient matching
+  ESC        Cancel a recording (or quit when idle)
+  Q          Quit
+
+  While typing a word:  ENTER = confirm, BACKSPACE = erase, ESC = cancel
 """
 
 import cv2
@@ -18,23 +24,37 @@ import json
 import math
 import os
 import time
+import zlib
+from collections import Counter, deque
 
 from cvzone.HandTrackingModule import HandDetector
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# -- Config -------------------------------------------------------------------
 CAM_INDEX       = 0
 CAM_WIDTH       = 1280
 CAM_HEIGHT      = 720
 DETECT_CON      = 0.7
 GESTURES_FILE   = "gestures.json"
-LETTERS         = list("ABCDE")
 
 # How many frames to average when recording (more = smoother, slower)
 RECORD_FRAMES   = 25
 
+# Seconds to get your hand(s) into position after naming a sign
+COUNTDOWN_SECS  = 3
+
 # Max normalised distance to count as a match (higher = more lenient)
 MATCH_THRESHOLD = 1.40
-# ─────────────────────────────────────────────────────────────────────────────
+
+# How much the position of one hand relative to the other matters
+# for two-hand signs (0 = ignore it entirely)
+REL_WEIGHT      = 0.5
+
+# Frames used to smooth detection so the result doesn't flicker
+SMOOTH_FRAMES   = 5
+
+MAX_LABEL_LEN   = 16
+SIDEBAR_W       = 260
+# -----------------------------------------------------------------------------
 
 SKELETON_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),
@@ -45,16 +65,25 @@ SKELETON_CONNECTIONS = [
     (5,9),(9,13),(13,17),
 ]
 
-LETTER_COLORS = {
-    "A": (255,  80,  80),
-    "B": ( 80, 200, 255),
-    "C": ( 80, 255, 160),
-    "D": (255, 200,  60),
-    "E": (200,  80, 255),
+# BGR colours; each word gets a stable colour from this palette
+PALETTE = [
+    (255,  80,  80), ( 80, 200, 255), ( 80, 255, 160), (255, 200,  60),
+    (200,  80, 255), (255, 120, 200), (120, 255, 255), (180, 255,  80),
+]
+
+STATE_BADGES = {
+    "DETECT":    (( 40, 150,  40), "DETECTING"),
+    "TYPING":    (( 20, 140, 200), "TYPE A WORD"),
+    "COUNTDOWN": ((180, 110,  20), "GET READY"),
+    "RECORDING": (( 40,  40, 200), "RECORDING"),
 }
 
 
-# ── Landmark normalisation ────────────────────────────────────────────────────
+def label_color(label):
+    return PALETTE[zlib.crc32(label.encode()) % len(PALETTE)]
+
+
+# -- Landmark features --------------------------------------------------------
 
 def normalize_landmarks(lm_list):
     """
@@ -62,9 +91,9 @@ def normalize_landmarks(lm_list):
 
     Steps:
       1. Translate all points so wrist (LM 0) is the origin.
-      2. Scale by the wrist → middle-MCP (LM 9) distance so hand size
+      2. Scale by the wrist -> middle-MCP (LM 9) distance so hand size
          doesn't matter (works at any distance from camera).
-      3. Flatten to a list of 42 floats: [x0,y0, x1,y1, … x20,y20].
+      3. Flatten to a list of 42 floats: [x0,y0, x1,y1, ... x20,y20].
 
     Returns None when the reference distance is too small (bad frame).
     """
@@ -79,9 +108,49 @@ def normalize_landmarks(lm_list):
     return vec
 
 
+def palm_size(lm_list):
+    return math.hypot(lm_list[9][0] - lm_list[0][0], lm_list[9][1] - lm_list[0][1])
+
+
+def extract_features(hands):
+    """
+    Build features from the detected hands.
+
+    Hands are ordered left-to-right on screen so two-hand signs are
+    compared consistently. For two hands we also store "rel": the offset
+    from the first wrist to the second, measured in palm sizes, so the
+    spacing/arrangement of the hands is part of the sign.
+
+    Returns {"hands": [vec, ...], "rel": [dx, dy] or None}, or None.
+    """
+    if not hands:
+        return None
+    lms  = sorted((h["lmList"] for h in hands), key=lambda lm: lm[0][0])
+    vecs = [normalize_landmarks(lm) for lm in lms]
+    if any(v is None for v in vecs):
+        return None
+    rel = None
+    if len(lms) == 2:
+        scale = (palm_size(lms[0]) + palm_size(lms[1])) / 2
+        rel = [(lms[1][0][0] - lms[0][0][0]) / scale,
+               (lms[1][0][1] - lms[0][0][1]) / scale]
+    return {"hands": vecs, "rel": rel}
+
+
 def average_vectors(vecs):
     """Element-wise average of a list of equal-length float lists."""
     return [sum(col) / len(col) for col in zip(*vecs)]
+
+
+def average_features(samples):
+    """Average a list of feature dicts that all have the same hand count."""
+    n_hands = len(samples[0]["hands"])
+    hands = [average_vectors([s["hands"][i] for s in samples])
+             for i in range(n_hands)]
+    rel = None
+    if samples[0]["rel"] is not None:
+        rel = average_vectors([s["rel"] for s in samples])
+    return {"hands": hands, "rel": rel}
 
 
 def vec_distance(a, b):
@@ -108,34 +177,79 @@ def vec_distance(a, b):
     return best
 
 
-# ── Gesture persistence ───────────────────────────────────────────────────────
+# -- Matching -----------------------------------------------------------------
 
-def load_gestures(path):
-    if os.path.exists(path):
-        with open(path) as f:
-            return json.load(f)
-    return {}
+def sign_distance(hand_vecs, rel, sign):
+    """
+    Distance between live hands and a saved sign with the same hand count.
+    For two-hand signs the WORSE of the two hands is used, so both hands
+    must match (one good hand can't hide a wrong one). This keeps the same
+    threshold meaningful for 1- and 2-hand signs. The hand-spacing term
+    is then added on top.
+    """
+    d = max(vec_distance(a, b) for a, b in zip(hand_vecs, sign["hands"]))
+    if rel is not None and sign.get("rel") is not None:
+        d += REL_WEIGHT * math.hypot(rel[0] - sign["rel"][0],
+                                     rel[1] - sign["rel"][1])
+    return d
 
 
-def save_gestures(path, gestures):
+def match_sign(feat, signs):
+    """
+    Return (label, distance) of the best sign under MATCH_THRESHOLD,
+    or (None, best_distance).
+
+    With two hands visible, two-hand signs are tried first; if none match,
+    one-hand signs are tried against either hand (so a one-hand sign still
+    works when the other hand happens to be in view).
+    """
+    best_label, best_dist = None, float("inf")
+    if feat is None:
+        return None, best_dist
+
+    if len(feat["hands"]) == 2:
+        for s in signs:
+            if len(s["hands"]) == 2:
+                d = sign_distance(feat["hands"], feat["rel"], s)
+                if d < best_dist:
+                    best_label, best_dist = s["label"], d
+        if best_dist <= MATCH_THRESHOLD:
+            return best_label, best_dist
+
+    for s in signs:
+        if len(s["hands"]) == 1:
+            for hv in feat["hands"]:
+                d = vec_distance(hv, s["hands"][0])
+                if d < best_dist:
+                    best_label, best_dist = s["label"], d
+
+    if best_dist <= MATCH_THRESHOLD:
+        return best_label, best_dist
+    return None, best_dist
+
+
+# -- Persistence --------------------------------------------------------------
+
+def load_signs(path):
+    """
+    Load saved signs. Also accepts the old A-E format ({"A": [42 floats]})
+    and converts it to one-hand signs automatically.
+    """
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        data = json.load(f)
+    if isinstance(data, dict) and "signs" in data:
+        return data["signs"]
+    return [{"label": k, "hands": [v], "rel": None} for k, v in data.items()]
+
+
+def save_signs(path, signs):
     with open(path, "w") as f:
-        json.dump(gestures, f, indent=2)
+        json.dump({"version": 2, "signs": signs}, f, indent=2)
 
 
-# ── Matching ──────────────────────────────────────────────────────────────────
-
-def match_gesture(vec, gestures):
-    """Return (letter, distance) of closest saved gesture, or (None, inf)."""
-    best_letter, best_dist = None, float("inf")
-    for letter, saved_vec in gestures.items():
-        d = vec_distance(vec, saved_vec)
-        if d < best_dist:
-            best_dist  = d
-            best_letter = letter
-    return best_letter, best_dist
-
-
-# ── Drawing ───────────────────────────────────────────────────────────────────
+# -- Drawing ------------------------------------------------------------------
 
 def draw_skeleton(img, lm_list, color=(0, 200, 255)):
     for a, b in SKELETON_CONNECTIONS:
@@ -144,104 +258,139 @@ def draw_skeleton(img, lm_list, color=(0, 200, 255)):
         cv2.circle(img, (lm[0], lm[1]), 5, (255, 255, 255), cv2.FILLED)
 
 
-def draw_sidebar(img, gestures, mode):
-    """Translucent left sidebar with mode badge and gesture list."""
-    h          = img.shape[0]
-    panel_w    = 230
-    overlay    = img.copy()
-    cv2.rectangle(overlay, (0, 0), (panel_w, h), (15, 15, 15), cv2.FILLED)
+def draw_sidebar(img, signs, state):
+    """Translucent left sidebar with state badge and saved-sign list."""
+    h       = img.shape[0]
+    overlay = img.copy()
+    cv2.rectangle(overlay, (0, 0), (SIDEBAR_W, h), (15, 15, 15), cv2.FILLED)
     cv2.addWeighted(overlay, 0.70, img, 0.30, 0, img)
 
+    badge_col, badge_txt = STATE_BADGES[state]
     y = 38
-    if mode == "RECORD":
-        badge_col = (180, 30, 30)
-        badge_txt = "  REC MODE"
-    else:
-        badge_col = (30, 140, 30)
-        badge_txt = "  DETECT MODE"
-    cv2.rectangle(img, (8, y - 24), (panel_w - 8, y + 8), badge_col, cv2.FILLED)
-    cv2.putText(img, badge_txt, (12, y),
+    cv2.rectangle(img, (8, y - 24), (SIDEBAR_W - 8, y + 8), badge_col, cv2.FILLED)
+    cv2.putText(img, "  " + badge_txt, (12, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 1)
     y += 44
 
-    cv2.putText(img, "Saved gestures", (12, y),
+    cv2.putText(img, f"Saved signs ({len(signs)})", (12, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (160, 160, 160), 1)
     y += 26
-    for letter in LETTERS:
-        saved = letter in gestures
-        col   = LETTER_COLORS[letter] if saved else (70, 70, 70)
-        icon  = "[SAVED]" if saved else "[ -- ]"
-        cv2.putText(img, f"  {letter}  {icon}", (12, y),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, col, 1)
-        y += 28
 
-    y += 12
+    hints = ["N      new sign",
+             "X      delete sign",
+             "+ / -  more/less lenient",
+             "ESC    cancel recording",
+             "Q      quit"]
+    hints_top = h - len(hints) * 19 - 40
+    max_rows  = max(0, (hints_top - y - 10) // 26)
+
+    ordered = sorted(signs, key=lambda s: s["label"])
+    if not ordered:
+        cv2.putText(img, "  none yet - press N", (12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (90, 90, 90), 1)
+    for i, s in enumerate(ordered):
+        if i == max_rows - 1 and len(ordered) > max_rows:
+            cv2.putText(img, f"  ... +{len(ordered) - i} more", (12, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.50, (120, 120, 120), 1)
+            break
+        col = label_color(s["label"])
+        cv2.putText(img, "  " + s["label"][:12], (12, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.56, col, 1)
+        cv2.putText(img, f"{len(s['hands'])}H", (SIDEBAR_W - 45, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.50, (150, 150, 150), 1)
+        y += 26
+
+    y = hints_top
     cv2.putText(img, f"Leniency: {MATCH_THRESHOLD:.2f}", (12, y),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.44, (180, 220, 180), 1)
     y += 24
-    for hint in ["SPACE  toggle mode",
-                 "A-E    record pose",
-                 "+ / -  more/less lenient",
-                 "X+ltr  delete pose",
-                 "Q/ESC  quit"]:
+    for hint in hints:
         cv2.putText(img, hint, (12, y),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (110, 110, 110), 1)
         y += 19
 
 
-def draw_record_progress(img, recording_letter, buf_len):
-    """Progress bar at the bottom while recording."""
+def draw_centered(img, text, y, scale, color, thick=1, font=cv2.FONT_HERSHEY_SIMPLEX):
+    """Draw text centred in the camera area (right of the sidebar)."""
+    w  = img.shape[1]
+    cx = SIDEBAR_W + (w - SIDEBAR_W) // 2
+    (tw, _), _ = cv2.getTextSize(text, font, scale, thick)
+    cv2.putText(img, text, (cx - tw // 2, y), font, scale, (0, 0, 0), thick + 3)
+    cv2.putText(img, text, (cx - tw // 2, y), font, scale, color, thick)
+
+
+def draw_text_prompt(img, purpose, text):
+    """Centered text-entry box for naming / deleting a sign."""
     h, w   = img.shape[:2]
-    bx, by = 10, h - 55
-    bw     = 220
+    cx     = SIDEBAR_W + (w - SIDEBAR_W) // 2
+    bw, bh = 560, 170
+    x0, y0 = cx - bw // 2, h // 2 - bh // 2
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + bw, y0 + bh), (20, 20, 20), cv2.FILLED)
+    cv2.addWeighted(overlay, 0.85, img, 0.15, 0, img)
+    cv2.rectangle(img, (x0, y0), (x0 + bw, y0 + bh), (200, 200, 200), 1)
+
+    title  = "Name the new sign:" if purpose == "record" else "Delete which sign?"
+    cursor = "_" if int(time.time() * 2) % 2 == 0 else " "
+    draw_centered(img, title, y0 + 40, 0.75, (220, 220, 220))
+    draw_centered(img, text + cursor, y0 + 100, 1.4, (80, 255, 200), 2)
+    draw_centered(img, "ENTER confirm  |  BACKSPACE erase  |  ESC cancel",
+                  y0 + 145, 0.48, (150, 150, 150))
+
+
+def draw_countdown(img, label, secs_left, n_hands):
+    h = img.shape[0]
+    draw_centered(img, f"Get ready to sign '{label}'", h // 2 - 120, 0.9, (255, 220, 120), 2)
+    draw_centered(img, str(secs_left), h // 2 + 60, 6, (255, 255, 255), 10,
+                  cv2.FONT_HERSHEY_DUPLEX)
+    hint = (f"{n_hands} hand(s) visible - will record a {n_hands}-hand sign"
+            if n_hands else "Show the hand(s) you want to use")
+    draw_centered(img, hint, h // 2 + 130, 0.65, (200, 200, 200))
+
+
+def draw_record_progress(img, label, buf_len, locked_hands):
+    """Progress bar at the bottom of the camera area while recording."""
+    h      = img.shape[0]
+    bx, by = SIDEBAR_W + 20, h - 60
+    bw     = 320
     filled = int(bw * buf_len / RECORD_FRAMES)
-    col    = LETTER_COLORS.get(recording_letter, (200, 200, 200))
+    col    = label_color(label)
+    hands_txt = f"{locked_hands}-hand" if locked_hands else "waiting for hands"
 
-    cv2.rectangle(img, (bx, by),         (bx + bw, by + 20), (40, 40, 40), cv2.FILLED)
-    cv2.rectangle(img, (bx, by),         (bx + filled, by + 20), col, cv2.FILLED)
-    cv2.putText(img, f"Recording  '{recording_letter}'  {buf_len}/{RECORD_FRAMES}",
-                (bx, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 1)
+    cv2.rectangle(img, (bx, by), (bx + bw, by + 20), (40, 40, 40), cv2.FILLED)
+    cv2.rectangle(img, (bx, by), (bx + filled, by + 20), col, cv2.FILLED)
+    cv2.putText(img, f"Recording '{label}' ({hands_txt})  {buf_len}/{RECORD_FRAMES}",
+                (bx, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1)
 
 
-def draw_detected(img, letter, dist, panel_w):
-    """Big centred letter with confidence bar on the right side of frame."""
-    if letter is None:
+def draw_detected(img, label, dist):
+    """Big centred word with a confidence bar, auto-sized to fit."""
+    if label is None:
         return
     h, w   = img.shape[:2]
+    area_w = w - SIDEBAR_W
+    cx     = SIDEBAR_W + area_w // 2
     conf   = max(0.0, 1.0 - dist / MATCH_THRESHOLD)
-    col    = LETTER_COLORS.get(letter, (255, 255, 255))
-    cx     = panel_w + (w - panel_w) // 2
+    col    = label_color(label)
 
-    # Shadow + letter
-    font, scale, thick = cv2.FONT_HERSHEY_DUPLEX, 11, 22
-    (tw, th), _ = cv2.getTextSize(letter, font, scale, thick)
+    font = cv2.FONT_HERSHEY_DUPLEX
+    (tw1, _), _ = cv2.getTextSize(label, font, 1.0, 2)
+    scale = min(9.0, (area_w * 0.85) / max(tw1, 1))
+    thick = max(2, int(scale * 2))
+    (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
     tx, ty = cx - tw // 2, h // 2 + th // 2
-    cv2.putText(img, letter, (tx + 5, ty + 5), font, scale, (0, 0, 0), thick + 6)
-    cv2.putText(img, letter, (tx,     ty),     font, scale, col,       thick)
+    cv2.putText(img, label, (tx + 5, ty + 5), font, scale, (0, 0, 0), thick + 6)
+    cv2.putText(img, label, (tx, ty), font, scale, col, thick)
 
-    # Confidence bar
     bar_w  = 320
-    bx     = cx - bar_w // 2
-    by     = ty + 28
-    filled = int(bar_w * conf)
-    cv2.rectangle(img, (bx, by),         (bx + bar_w, by + 20), (40, 40, 40), cv2.FILLED)
-    cv2.rectangle(img, (bx, by),         (bx + filled, by + 20), col, cv2.FILLED)
+    bx, by = cx - bar_w // 2, ty + 28
+    cv2.rectangle(img, (bx, by), (bx + bar_w, by + 20), (40, 40, 40), cv2.FILLED)
+    cv2.rectangle(img, (bx, by), (bx + int(bar_w * conf), by + 20), col, cv2.FILLED)
     cv2.putText(img, f"{int(conf * 100)}% confidence",
                 (bx, by + 44), cv2.FONT_HERSHEY_SIMPLEX, 0.60, col, 1)
 
 
-def draw_status(img, message, color=(255, 220, 60)):
-    """Temporary status message at the top-centre."""
-    h, w   = img.shape[:2]
-    (tw, _), _ = cv2.getTextSize(message, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 1)
-    cx = w // 2
-    cv2.putText(img, message, (cx - tw // 2, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 0, 0), 3)
-    cv2.putText(img, message, (cx - tw // 2, 36),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, color, 1)
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
+# -- Main ---------------------------------------------------------------------
 
 def main():
     global MATCH_THRESHOLD
@@ -251,35 +400,29 @@ def main():
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera {CAM_INDEX}.")
 
-    detector = HandDetector(detectionCon=DETECT_CON, maxHands=1)
-    gestures = load_gestures(GESTURES_FILE)
+    detector = HandDetector(detectionCon=DETECT_CON, maxHands=2)
+    signs    = load_signs(GESTURES_FILE)
 
-    mode             = "RECORD"
-    recording_letter = None
-    record_buffer    = []
-    detected_letter  = None
-    detected_dist    = float("inf")
+    state          = "DETECT"   # DETECT | TYPING | COUNTDOWN | RECORDING
+    prompt_purpose = None       # "record" | "delete"
+    text_buffer    = ""
+    record_label   = None
+    record_hands   = None       # hand count locked in on first recorded frame
+    record_buffer  = []
+    countdown_end  = 0.0
 
-    # Temporary status message
-    status_msg       = ""
-    status_color     = (255, 220, 60)
-    status_until     = 0.0
+    history   = deque(maxlen=SMOOTH_FRAMES)
+    last_dist = {}
 
-    # X + letter delete combo
-    delete_armed     = False
-    delete_arm_time  = 0.0
-
+    status_msg, status_color, status_until = "", (255, 220, 60), 0.0
     prev_time = time.time()
-    SIDEBAR_W = 230
-
-    print(f"Loaded gestures: {list(gestures.keys()) or 'none'}")
-    print("SPACE=toggle mode | A-E=record | X+letter=delete | Q=quit\n")
 
     def set_status(msg, col=(255, 220, 60), duration=2.0):
         nonlocal status_msg, status_color, status_until
-        status_msg   = msg
-        status_color = col
-        status_until = time.time() + duration
+        status_msg, status_color, status_until = msg, col, time.time() + duration
+
+    print(f"Loaded signs: {[s['label'] for s in signs] or 'none'}")
+    print("N=new sign | X=delete | +/-=leniency | Q=quit\n")
 
     while True:
         success, img = cap.read()
@@ -287,108 +430,126 @@ def main():
             continue
 
         hands, img = detector.findHands(img, draw=False, flipType=True)
+        feat = extract_features(hands)
 
-        # ── Landmark extraction ───────────────────────────────────────────────
-        normalized = None
-        if hands:
-            lm_list    = hands[0]["lmList"]
-            normalized = normalize_landmarks(lm_list)
-            skel_color = (LETTER_COLORS.get(detected_letter, (0, 200, 255))
-                          if mode == "DETECT" and detected_letter else (0, 200, 255))
-            draw_skeleton(img, lm_list, skel_color)
-
-        # ── Recording ─────────────────────────────────────────────────────────
-        if recording_letter:
-            if normalized:
-                record_buffer.append(normalized)
-                if len(record_buffer) >= RECORD_FRAMES:
-                    avg = average_vectors(record_buffer)
-                    gestures[recording_letter] = avg
-                    save_gestures(GESTURES_FILE, gestures)
-                    set_status(f"[OK] Saved '{recording_letter}'", (80, 255, 120))
-                    print(f"[OK] Saved gesture for '{recording_letter}'")
-                    recording_letter = None
-                    record_buffer    = []
-            else:
-                set_status("Show your hand to the camera!", (60, 60, 255))
-                record_buffer = []  # reset if hand disappears mid-recording
-
-        # ── Detection ─────────────────────────────────────────────────────────
-        if mode == "DETECT":
-            if normalized and gestures:
-                detected_letter, detected_dist = match_gesture(normalized, gestures)
-                if detected_dist > MATCH_THRESHOLD:
-                    detected_letter = None
-            else:
-                detected_letter = None
+        # -- Detection (smoothed) ---------------------------------------------
+        shown_label = None
+        if state == "DETECT":
+            label, dist = match_sign(feat, signs)
+            history.append(label)
+            if label:
+                last_dist[label] = dist
+            top, count = Counter(history).most_common(1)[0]
+            if top is not None and count >= SMOOTH_FRAMES // 2 + 1:
+                shown_label = top
         else:
-            detected_letter = None
+            history.clear()
 
-        # ── Draw UI ───────────────────────────────────────────────────────────
-        draw_sidebar(img, gestures, mode)
+        skel_col = label_color(shown_label) if shown_label else (0, 200, 255)
+        for hand in hands:
+            draw_skeleton(img, hand["lmList"], skel_col)
 
-        if mode == "DETECT":
-            draw_detected(img, detected_letter, detected_dist, SIDEBAR_W)
+        # -- Countdown -> recording -------------------------------------------
+        if state == "COUNTDOWN" and time.time() >= countdown_end:
+            state, record_buffer, record_hands = "RECORDING", [], None
 
-        if recording_letter:
-            draw_record_progress(img, recording_letter, len(record_buffer))
+        if state == "RECORDING":
+            if feat is None:
+                set_status("Show your hand(s) to the camera!", (60, 60, 255), 0.5)
+            else:
+                n = len(feat["hands"])
+                if record_hands is None:
+                    record_hands = n
+                if n == record_hands:
+                    record_buffer.append(feat)
+                else:
+                    set_status(f"Keep {record_hands} hand(s) in view", (60, 60, 255), 0.5)
+
+            if len(record_buffer) >= RECORD_FRAMES:
+                avg   = average_features(record_buffer)
+                signs = [s for s in signs if s["label"] != record_label]
+                signs.append({"label": record_label, **avg})
+                save_signs(GESTURES_FILE, signs)
+                set_status(f"[OK] Saved '{record_label}' ({record_hands}-hand sign)",
+                           (80, 255, 120))
+                print(f"[OK] Saved '{record_label}' ({record_hands}-hand sign)")
+                state = "DETECT"
+
+        # -- Draw UI ----------------------------------------------------------
+        draw_sidebar(img, signs, state)
+
+        if state == "DETECT":
+            draw_detected(img, shown_label, last_dist.get(shown_label, 0.0))
+        elif state == "TYPING":
+            draw_text_prompt(img, prompt_purpose, text_buffer)
+        elif state == "COUNTDOWN":
+            secs_left = max(1, math.ceil(countdown_end - time.time()))
+            draw_countdown(img, record_label, secs_left, len(feat["hands"]) if feat else 0)
+        elif state == "RECORDING":
+            draw_record_progress(img, record_label, len(record_buffer), record_hands)
 
         if time.time() < status_until:
-            draw_status(img, status_msg, status_color)
+            draw_centered(img, status_msg, 36, 0.65, status_color)
 
-        # FPS
         curr_time = time.time()
         fps       = 1 / (curr_time - prev_time + 1e-9)
         prev_time = curr_time
-        cv2.putText(img, f"FPS {int(fps)}", (CAM_WIDTH - 100, 36),
+        cv2.putText(img, f"FPS {int(fps)}", (img.shape[1] - 100, 36),
                     cv2.FONT_HERSHEY_PLAIN, 1.5, (0, 255, 0), 2)
 
-        cv2.imshow("Custom Sign Language Alphabet", img)
+        cv2.imshow("Custom Sign Language Translator", img)
         key = cv2.waitKey(1) & 0xFF
+        if key == 255:          # no key pressed
+            continue
 
-        # ── Key handling ──────────────────────────────────────────────────────
-        if key in (ord('q'), ord('Q'), 27):
+        # -- Key handling: typing a word --------------------------------------
+        if state == "TYPING":
+            if key == 27:                               # ESC
+                state = "DETECT"
+                set_status("Cancelled", (160, 160, 160))
+            elif key in (13, 10):                       # ENTER
+                label = text_buffer.strip()
+                if not label:
+                    set_status("Type a word first", (60, 60, 255))
+                elif prompt_purpose == "record":
+                    record_label  = label
+                    countdown_end = time.time() + COUNTDOWN_SECS
+                    state         = "COUNTDOWN"
+                    print(f"[*] Recording '{label}' - get into position...")
+                else:
+                    if any(s["label"] == label for s in signs):
+                        signs = [s for s in signs if s["label"] != label]
+                        save_signs(GESTURES_FILE, signs)
+                        set_status(f"Deleted '{label}'", (60, 60, 255))
+                        print(f"[X] Deleted '{label}'")
+                    else:
+                        set_status(f"No sign called '{label}'", (140, 140, 140))
+                    state = "DETECT"
+            elif key in (8, 127):                       # BACKSPACE
+                text_buffer = text_buffer[:-1]
+            elif 32 <= key < 127:
+                ch = chr(key).upper()
+                if (ch.isalnum() or ch in " '-") and len(text_buffer) < MAX_LABEL_LEN:
+                    text_buffer += ch
+            continue
+
+        # -- Key handling: everything else ------------------------------------
+        if key == 27 and state in ("COUNTDOWN", "RECORDING"):
+            state = "DETECT"
+            set_status("Recording cancelled", (160, 160, 160))
+            print("Recording cancelled")
+
+        elif key in (ord('q'), ord('Q'), 27):
             break
 
-        elif key == ord(' '):
-            mode             = "DETECT" if mode == "RECORD" else "RECORD"
-            recording_letter = None
-            record_buffer    = []
-            detected_letter  = None
-            set_status(f"Switched to {mode} mode")
-            print(f"-> {mode} mode")
+        elif key in (ord('n'), ord('N')) and state == "DETECT":
+            state, prompt_purpose, text_buffer = "TYPING", "record", ""
 
-        elif (chr(key).upper() in LETTERS) if 0 <= key < 128 else False:
-            letter = chr(key).upper()
-
-            if delete_armed and (time.time() - delete_arm_time < 1.5):
-                # X + letter = delete gesture
-                if letter in gestures:
-                    del gestures[letter]
-                    save_gestures(GESTURES_FILE, gestures)
-                    set_status(f"Deleted '{letter}'", (60, 60, 255))
-                    print(f"[X] Deleted gesture for '{letter}'")
-                else:
-                    set_status(f"'{letter}' not saved yet", (140, 140, 140))
-                delete_armed = False
-
-            elif mode == "RECORD":
-                if normalized is None:
-                    set_status("No hand detected - show your hand first!", (60, 60, 255))
-                    print("[!] No hand in frame.")
-                else:
-                    recording_letter = letter
-                    record_buffer    = []
-                    set_status(f"Hold pose for '{letter}'...", (255, 200, 60), 3.0)
-                    print(f"[*] Recording '{letter}' - hold pose steady...")
+        elif key in (ord('x'), ord('X')) and state == "DETECT":
+            if signs:
+                state, prompt_purpose, text_buffer = "TYPING", "delete", ""
             else:
-                set_status("Switch to REC mode (SPACE) to record")
-
-        elif key in (ord('x'), ord('X')):
-            delete_armed    = True
-            delete_arm_time = time.time()
-            set_status("Delete armed - press A-E to delete that gesture", (255, 100, 100))
-            print("Delete armed - press a letter within 1.5 s")
+                set_status("No signs to delete", (140, 140, 140))
 
         elif key in (ord('+'), ord('=')):
             MATCH_THRESHOLD = min(3.50, round(MATCH_THRESHOLD + 0.15, 2))
