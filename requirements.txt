@@ -1,3 +1,5 @@
 opencv-python>=4.8.0
 mediapipe>=0.10.0
+numpy
+# Only required by the legacy scripts (custom_alphabet.py, hand_tracking.py, finger_counter.py)
 cvzone>=1.6.1
